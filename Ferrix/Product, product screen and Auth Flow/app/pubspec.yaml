@@ -1,0 +1,16 @@
+name: auth_app
+description: Auth flow client
+publish_to: 'none'
+version: 1.0.0
+
+environment:
+  sdk: ^3.4.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.2.0
+  flutter_secure_storage: ^9.2.2
+
+flutter:
+  uses-material-design: true
