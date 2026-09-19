@@ -1,72 +1,505 @@
-┌──────────────────────────────────────────────────────────────┐
-│                                                              │
-│                    PRESENTATION LAYER                        │
-│                                                              │
-│   auth_controller.dart    auth_middleware.dart               │
-│   cors_middleware.dart    (server.dart routes)               │
-│                                                              │
-│   • Talks HTTP                                               │
-│   • Parses JSON                                              │
-│   • Maps errors → status codes                               │
-│   • No business logic                                        │
-│                                                              │
-└──────────────────────────┬───────────────────────────────────┘
-                           │ calls
-                           ▼
-┌──────────────────────────────────────────────────────────────┐
-│                                                              │
-│                    APPLICATION LAYER                         │
-│                                                              │
-│   sign_up_use_case.dart        login_use_case.dart           │
-│   verify_email_use_case.dart   resend_otp_use_case.dart      │
-│   auth_dtos.dart                                             │
-│                                                              │
-│   • Orchestrates the flow                                    │
-│   • One use case = one user action                           │
-│   • Depends only on DOMAIN contracts (abstractions)          │
-│                                                              │
-└──────────────────────────┬───────────────────────────────────┘
-                           │ uses
-                           ▼
-┌──────────────────────────────────────────────────────────────┐
-│                                                              │
-│                       DOMAIN LAYER                           │
-│                    ⚠️ NO DEPENDENCIES ⚠️                     │
-│                                                              │
-│   ENTITIES               VALUE OBJECTS                       │
-│   • user.dart            • email.dart                        │
-│   • otp.dart             • password.dart                     │
-│                          • full_name.dart                    │
-│   ENUMS                  • user_id.dart                      │
-│   • user_status.dart     • otp_code.dart                     │
-│   • otp_purpose.dart                                         │
-│                                                              │
-│   ERRORS                 REPOSITORY CONTRACTS                │
-│   • auth_errors.dart     • user_repository.dart              │
-│                          • otp_repository.dart               │
-│   DOMAIN SERVICE         • password_hasher.dart              │
-│   • auth_domain_service  • email_sender.dart                 │
-│                          • token_service.dart                │
-│                                                              │
-│   • Pure Dart logic                                          │
-│   • No bcrypt, no JWT, no shelf, no DB                       │
-│   • Just interfaces + rules                                  │
-│                                                              │
-└──────────────────────────▲───────────────────────────────────┘
-                           │ implements
-                           │
-┌──────────────────────────┴───────────────────────────────────┐
-│                                                              │
-│                  INFRASTRUCTURE LAYER                        │
-│                                                              │
-│   bcrypt_password_hasher.dart       (implements hasher)      │
-│   jwt_token_service.dart            (implements tokens)      │
-│   in_memory_user_repository.dart    (implements repo)        │
-│   in_memory_otp_repository.dart     (implements repo)        │
-│   console_email_sender.dart         (implements sender)      │
-│   resend_email_sender.dart          (implements sender)      │
-│                                                              │
-│   • Talks to the outside world                               │
-│   • Swappable — change 1 line to swap                        │
-│                                                              │
-└──────────────────────────────────────────────────────────────┘
+// ═══════════════════════════════════════════════════════════════
+//  ARCHITECTURE DEMO — the diagram, alive
+//
+//  Every arrow in the ASCII diagram becomes a step in the flow.
+//  Run: dart run bin/architecture_demo.dart
+// ═══════════════════════════════════════════════════════════════
+
+import 'dart:convert';
+import 'dart:math';
+
+// ───────────────────────────────────────────────────────────────
+//  HELPER — draws the layer box before each step
+// ───────────────────────────────────────────────────────────────
+void enterLayer(String name, String subtitle) {
+  print('');
+  print('┌──────────────────────────────────────────────────────────────┐');
+  print('│  ${name.padRight(60)}│');
+  print('│  ${subtitle.padRight(60)}│');
+  print('└──────────────────────────────────────────────────────────────┘');
+}
+
+void arrow(String label) => print('        │ $label');
+
+// ═══════════════════════════════════════════════════════════════
+//  DOMAIN LAYER  —  no external dependencies
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Value Objects ───────────────────────────────────────────────
+
+class Email {
+  final String value;
+  Email._(this.value);
+
+  factory Email(String raw) {
+    final trimmed = raw.trim().toLowerCase();
+    if (!RegExp(r'^[\w\.\-]+@([\w\-]+\.)+[\w\-]{2,}$').hasMatch(trimmed)) {
+      throw ValidationError('Invalid email');
+    }
+    return Email._(trimmed);
+  }
+  @override
+  String toString() => value;
+}
+
+class RawPassword {
+  final String value;
+  RawPassword._(this.value);
+
+  factory RawPassword(String raw) {
+    if (raw.length < 8) throw ValidationError('Password too short');
+    if (!raw.contains(RegExp(r'[A-Z]'))) throw ValidationError('No uppercase');
+    if (!raw.contains(RegExp(r'[0-9]'))) throw ValidationError('No digit');
+    return RawPassword._(raw);
+  }
+}
+
+class HashedPassword {
+  final String value;
+  HashedPassword(this.value);
+}
+
+class UserId {
+  final String value;
+  UserId._(this.value);
+  factory UserId(String v) => UserId._(v);
+  @override
+  String toString() => value;
+}
+
+class FullName {
+  final String value;
+  FullName._(this.value);
+  factory FullName(String v) {
+    if (v.trim().isEmpty) throw ValidationError('Name required');
+    return FullName._(v.trim());
+  }
+  @override
+  String toString() => value;
+}
+
+class OtpCode {
+  final String value;
+  OtpCode._(this.value);
+  factory OtpCode(String raw) {
+    if (!RegExp(r'^\d{6}$').hasMatch(raw)) {
+      throw ValidationError('OTP must be 6 digits');
+    }
+    return OtpCode._(raw);
+  }
+  factory OtpCode.generated(String raw) => OtpCode._(raw);
+  @override
+  String toString() => value;
+}
+
+// ─── Enums ───────────────────────────────────────────────────────
+
+enum UserStatus { pending, active, locked }
+enum OtpPurpose { emailVerification, passwordReset }
+
+// ─── Errors ──────────────────────────────────────────────────────
+
+sealed class AuthError implements Exception {
+  final String message;
+  AuthError(this.message);
+  @override
+  String toString() => message;
+}
+
+class ValidationError extends AuthError {
+  ValidationError(super.m);
+}
+class EmailAlreadyExistsError extends AuthError {
+  EmailAlreadyExistsError() : super('Email already registered');
+}
+class UserNotFoundError extends AuthError {
+  UserNotFoundError() : super('User not found');
+}
+class InvalidCredentialsError extends AuthError {
+  InvalidCredentialsError() : super('Invalid credentials');
+}
+class UserNotVerifiedError extends AuthError {
+  UserNotVerifiedError() : super('Email not verified');
+}
+class OtpInvalidError extends AuthError {
+  OtpInvalidError() : super('Invalid OTP');
+}
+
+// ─── Entities ────────────────────────────────────────────────────
+
+class User {
+  final UserId id;
+  final FullName name;
+  final Email email;
+  final HashedPassword passwordHash;
+  final UserStatus status;
+  final DateTime createdAt;
+
+  User({
+    required this.id,
+    required this.name,
+    required this.email,
+    required this.passwordHash,
+    required this.status,
+    required this.createdAt,
+  });
+
+  User copyWith({UserStatus? status}) => User(
+        id: id,
+        name: name,
+        email: email,
+        passwordHash: passwordHash,
+        status: status ?? this.status,
+        createdAt: createdAt,
+      );
+}
+
+class Otp {
+  final Email email;
+  final String hashedCode;
+  final OtpPurpose purpose;
+  final DateTime expiresAt;
+  int attempts;
+  Otp({
+    required this.email,
+    required this.hashedCode,
+    required this.purpose,
+    required this.expiresAt,
+    this.attempts = 0,
+  });
+  bool get isExpired => DateTime.now().isAfter(expiresAt);
+}
+
+// ─── Repository Contracts ────────────────────────────────────────
+
+abstract class UserRepository {
+  Future<User?> findByEmail(Email email);
+  Future<void> save(User user);
+  Future<void> update(User user);
+}
+
+abstract class OtpRepository {
+  Future<void> save(Otp otp);
+  Future<Otp?> find(Email email, OtpPurpose purpose);
+  Future<void> delete(Email email, OtpPurpose purpose);
+}
+
+abstract class PasswordHasher {
+  HashedPassword hash(RawPassword password);
+  bool verify(RawPassword password, HashedPassword hash);
+}
+
+abstract class EmailSender {
+  Future<void> sendOtp(Email to, OtpCode code);
+}
+
+abstract class TokenService {
+  String issue(UserId userId);
+}
+
+// ─── Domain Service ──────────────────────────────────────────────
+
+class AuthDomainService {
+  final _random = Random.secure();
+
+  OtpCode generateOtp() {
+    final code = List.generate(6, (_) => _random.nextInt(10)).join();
+    return OtpCode.generated(code);
+  }
+
+  void assertCanLogin(User user, bool passwordMatches) {
+    if (!passwordMatches) throw InvalidCredentialsError();
+    if (user.status != UserStatus.active) throw UserNotVerifiedError();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  INFRASTRUCTURE LAYER  —  implements domain contracts
+// ═══════════════════════════════════════════════════════════════
+
+class InMemoryUserRepository implements UserRepository {
+  final Map<String, User> _byEmail = {};
+  @override
+  Future<User?> findByEmail(Email email) async => _byEmail[email.value];
+  @override
+  Future<void> save(User user) async {
+    _byEmail[user.email.value] = user;
+    print('        💾 [DB] saved user ${user.email.value}');
+  }
+  @override
+  Future<void> update(User user) async {
+    _byEmail[user.email.value] = user;
+    print('        💾 [DB] updated user ${user.email.value}');
+  }
+}
+
+class InMemoryOtpRepository implements OtpRepository {
+  final Map<String, Otp> _store = {};
+  String _key(Email e, OtpPurpose p) => '${e.value}::${p.name}';
+  @override
+  Future<void> save(Otp otp) async {
+    _store[_key(otp.email, otp.purpose)] = otp;
+    print('        💾 [DB] saved OTP for ${otp.email.value}');
+  }
+  @override
+  Future<Otp?> find(Email e, OtpPurpose p) async => _store[_key(e, p)];
+  @override
+  Future<void> delete(Email e, OtpPurpose p) async {
+    _store.remove(_key(e, p));
+    print('        🗑  [DB] deleted OTP for ${e.value}');
+  }
+}
+
+/// Fake hasher (real one uses bcrypt). Same output shape.
+class FakePasswordHasher implements PasswordHasher {
+  @override
+  HashedPassword hash(RawPassword password) {
+    final fake = 'hash(${password.value})';
+    print('        🔐 [Hasher] produced hash');
+    return HashedPassword(fake);
+  }
+  @override
+  bool verify(RawPassword password, HashedPassword hash) =>
+      hash.value == 'hash(${password.value})';
+}
+
+/// Fake token service (real one uses JWT).
+class FakeTokenService implements TokenService {
+  @override
+  String issue(UserId userId) {
+    final token = 'token-for-${userId.value}';
+    print('        🎟  [Tokens] issued: $token');
+    return token;
+  }
+}
+
+/// Console email sender (production uses Resend).
+class ConsoleEmailSender implements EmailSender {
+  @override
+  Future<void> sendOtp(Email to, OtpCode code) async {
+    print('');
+    print('        ┌────────────────────────────────────────┐');
+    print('        │ 📧 EMAIL → ${to.value.padRight(27)}│');
+    print('        │ 🔐 OTP   → ${code.value.padRight(27)}│');
+    print('        └────────────────────────────────────────┘');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  APPLICATION LAYER  —  use cases (orchestration)
+// ═══════════════════════════════════════════════════════════════
+
+class SignUpUseCase {
+  final UserRepository _users;
+  final OtpRepository _otps;
+  final PasswordHasher _hasher;
+  final EmailSender _emails;
+  final AuthDomainService _domain;
+
+  SignUpUseCase({
+    required UserRepository users,
+    required OtpRepository otps,
+    required PasswordHasher hasher,
+    required EmailSender emails,
+    required AuthDomainService domain,
+  })  : _users = users,
+        _otps = otps,
+        _hasher = hasher,
+        _emails = emails,
+        _domain = domain;
+
+  Future<void> call({
+    required String name,
+    required String email,
+    required String password,
+  }) async {
+    print('    ▶ SignUpUseCase.call()');
+    print('      → validating value objects');
+    final voName = FullName(name);
+    final voEmail = Email(email);
+    final voPassword = RawPassword(password);
+    print('      ✓ VOs valid');
+
+    print('      → checking uniqueness');
+    final existing = await _users.findByEmail(voEmail);
+    if (existing != null) throw EmailAlreadyExistsError();
+
+    print('      → hashing password');
+    final hashed = _hasher.hash(voPassword);
+
+    print('      → building User entity');
+    final user = User(
+      id: UserId('11111111-1111-1111-1111-111111111111'),
+      name: voName,
+      email: voEmail,
+      passwordHash: hashed,
+      status: UserStatus.pending,
+      createdAt: DateTime.now(),
+    );
+
+    print('      → saving user');
+    await _users.save(user);
+
+    print('      → generating OTP');
+    final code = _domain.generateOtp();
+
+    // Simulate hashing the OTP (real code uses sha256)
+    final hashedOtp = base64.encode(utf8.encode(code.value));
+
+    print('      → storing OTP');
+    await _otps.save(Otp(
+      email: voEmail,
+      hashedCode: hashedOtp,
+      purpose: OtpPurpose.emailVerification,
+      expiresAt: DateTime.now().add(const Duration(minutes: 10)),
+    ));
+
+    print('      → sending email');
+    await _emails.sendOtp(voEmail, code);
+
+    print('    ◀ SignUpUseCase done');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  PRESENTATION LAYER  —  controller (HTTP stub)
+// ═══════════════════════════════════════════════════════════════
+
+class AuthController {
+  final SignUpUseCase _signUp;
+  AuthController({required SignUpUseCase signUp}) : _signUp = signUp;
+
+  /// In real code this receives a shelf Request and returns Response.
+  /// Here we simulate it with a plain map.
+  Future<Map<String, dynamic>> signup(Map<String, dynamic> body) async {
+    print('  ▶ AuthController.signup()');
+    print('    → parsed JSON: $body');
+    try {
+      await _signUp(
+        name: body['name'],
+        email: body['email'],
+        password: body['password'],
+      );
+      print('  ◀ 200 OK');
+      return {'status': 200, 'message': 'Signup successful'};
+    } on ValidationError catch (e) {
+      print('  ◀ 400 Bad Request — ${e.message}');
+      return {'status': 400, 'error': e.message};
+    } on EmailAlreadyExistsError catch (e) {
+      print('  ◀ 409 Conflict — ${e.message}');
+      return {'status': 409, 'error': e.message};
+    } catch (e) {
+      print('  ◀ 500 — $e');
+      return {'status': 500, 'error': 'Internal error'};
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  COMPOSITION ROOT  —  wires everything together
+// ═══════════════════════════════════════════════════════════════
+
+Future<void> main() async {
+  print('╔══════════════════════════════════════════════════════════════╗');
+  print('║        AUTH FLOW — CLEAN ARCHITECTURE DEMO (Dart)            ║');
+  print('╚══════════════════════════════════════════════════════════════╝');
+
+  // ─── 1. Build infrastructure ──────────────────────────────────
+  enterLayer('INFRASTRUCTURE', 'building concrete adapters');
+  final userRepo = InMemoryUserRepository();
+  final otpRepo = InMemoryOtpRepository();
+  final hasher = FakePasswordHasher();
+  final tokens = FakeTokenService();
+  final emails = ConsoleEmailSender();
+  print('  ✓ 5 adapters created:');
+  print('      • InMemoryUserRepository');
+  print('      • InMemoryOtpRepository');
+  print('      • FakePasswordHasher');
+  print('      • FakeTokenService');
+  print('      • ConsoleEmailSender');
+
+  // ─── 2. Domain service ────────────────────────────────────────
+  enterLayer('DOMAIN', 'creating pure-logic service');
+  final domain = AuthDomainService();
+  print('  ✓ AuthDomainService created (no external deps)');
+
+  // ─── 3. Application — wire use cases ──────────────────────────
+  enterLayer('APPLICATION', 'wiring use cases to domain contracts');
+  final signUp = SignUpUseCase(
+    users: userRepo,
+    otps: otpRepo,
+    hasher: hasher,
+    emails: emails,
+    domain: domain,
+  );
+  print('  ✓ SignUpUseCase wired (knows only interfaces)');
+
+  // ─── 4. Presentation ─────────────────────────────────────────
+  enterLayer('PRESENTATION', 'creating controller');
+  final controller = AuthController(signUp: signUp);
+  print('  ✓ AuthController ready');
+
+  // ─── 5. Simulate an HTTP request ─────────────────────────────
+  print('');
+  print('══════════════════════════════════════════════════════════════');
+  print('  SIMULATION: POST /auth/signup');
+  print('  body = { name: "Ali", email: "ali@test.com", password: "Passw0rd" }');
+  print('══════════════════════════════════════════════════════════════');
+  arrow('Presentation');
+
+  enterLayer('PRESENTATION', 'AuthController receives request');
+  final response = await controller.signup({
+    'name': 'Ali',
+    'email': 'ali@test.com',
+    'password': 'Passw0rd',
+  });
+
+  arrow('calls use case');
+  enterLayer('APPLICATION', 'SignUpUseCase orchestrates');
+  // (the print statements inside the use case show the work)
+
+  arrow('uses domain contracts');
+  enterLayer('DOMAIN', 'VOs + entities validate the data');
+  // (validation already happened inside the use case)
+
+  arrow('infrastructure implements');
+  enterLayer('INFRASTRUCTURE', 'adapters do the real work');
+  // (the DB, hasher, email prints already happened)
+
+  print('');
+  print('══════════════════════════════════════════════════════════════');
+  print('  RESPONSE: $response');
+  print('══════════════════════════════════════════════════════════════');
+
+  // ─── 6. Second request to show the "already exists" path ─────
+  print('');
+  print('══════════════════════════════════════════════════════════════');
+  print('  SIMULATION 2: same signup again (should fail)');
+  print('══════════════════════════════════════════════════════════════');
+  final response2 = await controller.signup({
+    'name': 'Ali',
+    'email': 'ali@test.com',
+    'password': 'Passw0rd',
+  });
+  print('');
+  print('  RESPONSE: $response2');
+
+  // ─── 7. Show the "wrong password format" path ────────────────
+  print('');
+  print('══════════════════════════════════════════════════════════════');
+  print('  SIMULATION 3: weak password (should fail validation)');
+  print('══════════════════════════════════════════════════════════════');
+  final response3 = await controller.signup({
+    'name': 'Bob',
+    'email': 'bob@test.com',
+    'password': 'weak',
+  });
+  print('');
+  print('  RESPONSE: $response3');
+
+  print('');
+  print('╔══════════════════════════════════════════════════════════════╗');
+  print('║  DONE — every layer performed its job in order.              ║');
+  print('║  Notice: no layer ever skipped another.                      ║');
+  print('╚══════════════════════════════════════════════════════════════╝');
+}
