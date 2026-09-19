@@ -1,24 +1,33 @@
-// lib/auth/models/user.dart
 class User {
   final String id;
+  final String name;
   final String email;
-  final String? displayName;
+  final String passwordHash;
+  bool isVerified;
+  final DateTime createdAt;
 
-  const User({
+  User({
     required this.id,
+    required this.name,
     required this.email,
-    this.displayName,
+    required this.passwordHash,
+    this.isVerified = false,
+    required this.createdAt,
   });
-
-  factory User.fromJson(Map<String, dynamic> json) => User(
-        id: json['id'] as String,
-        email: json['email'] as String,
-        displayName: json['displayName'] as String?,
-      );
 
   Map<String, dynamic> toJson() => {
         'id': id,
+        'name': name,
         'email': email,
-        'displayName': displayName,
+        'isVerified': isVerified,
+        'createdAt': createdAt.toIso8601String(),
+      };
+
+  // Never expose passwordHash when sending to client
+  Map<String, dynamic> toSafeJson() => {
+        'id': id,
+        'name': name,
+        'email': email,
+        'isVerified': isVerified,
       };
 }
